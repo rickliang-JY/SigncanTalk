@@ -1,0 +1,8 @@
+transformers>=4.46.0
+accelerate>=0.34.0
+torch>=2.4.0
+gradio>=4.44.0
+opencv-python-headless>=4.10.0
+pillow>=10.0.0
+numpy>=1.26.0
+huggingface_hub>=0.25.0
