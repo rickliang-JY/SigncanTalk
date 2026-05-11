@@ -7,7 +7,27 @@ from typing import Any
 
 import torch
 from PIL import Image
-from transformers import AutoModelForMultimodalLM, AutoProcessor
+from transformers import AutoProcessor
+
+
+def _load_multimodal_model_class():
+    import transformers as _tf
+    for name in (
+        "AutoModelForMultimodalLM",
+        "AutoModelForImageTextToText",
+        "AutoModelForVision2Seq",
+        "AutoModelForCausalLM",
+    ):
+        cls = getattr(_tf, name, None)
+        if cls is not None:
+            return cls, name
+    raise ImportError(
+        "No suitable multimodal model class found in transformers. "
+        "Try: pip install -U transformers"
+    )
+
+
+_MODEL_CLS, _MODEL_CLS_NAME = _load_multimodal_model_class()
 
 from .config import (
     DEVICE_MAP,
@@ -32,12 +52,13 @@ class SignTranslator:
     def __init__(self, model_id: str = MODEL_ID):
         self.model_id = model_id
         self.processor = AutoProcessor.from_pretrained(model_id)
-        self.model = AutoModelForMultimodalLM.from_pretrained(
+        self.model = _MODEL_CLS.from_pretrained(
             model_id,
             device_map=DEVICE_MAP,
-            torch_dtype=_DTYPE_MAP[DTYPE],
+            dtype=_DTYPE_MAP[DTYPE],
         )
         self.model.eval()
+        print(f"[SignTranslator] loaded model with class: {_MODEL_CLS_NAME}")
 
     @torch.inference_mode()
     def translate_video(
