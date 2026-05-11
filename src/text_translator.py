@@ -1,13 +1,21 @@
-"""Pure-text cross-sign-language translator: CSL gloss -> Chinese -> English -> ASL gloss.
+"""Validate the foundational primitive: sign language <-> natural language.
 
-This module tests whether Gemma 4 can do the language-pivot translation
-WITHOUT needing visual input. If this works, the architecture is validated.
+For ONE sign system (CSL or ASL), test both directions:
+  - sign_to_natural: gloss sequence -> natural language sentence
+  - natural_to_sign: natural language sentence -> gloss sequence
+
+Cross-sign translation (CSL -> Chinese -> English -> ASL) is only valid if
+all 4 primitives below work reliably:
+  CSL gloss  <-> Chinese
+  ASL gloss  <-> English
+
+This module tests the primitives. The cross-sign chain is built on top later.
 """
 from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from transformers import AutoProcessor
@@ -23,68 +31,77 @@ _DTYPE_MAP = {
 }
 
 
-CROSS_SIGN_SYSTEM_PROMPT = """You are an expert sign language translator working across CSL (Chinese Sign Language) and ASL (American Sign Language).
+SignSystem = Literal["CSL", "ASL"]
 
-Your task: translate a CSL gloss sequence through a 3-stage pipeline:
-  Stage 1: CSL gloss -> natural Chinese
-  Stage 2: Chinese -> natural English
-  Stage 3: English -> ASL gloss
 
-Key grammar rules:
-
-CSL grammar:
+SIGN_GRAMMAR_NOTES = {
+    "CSL": """CSL (Chinese Sign Language) grammar:
 - Often topic-comment structure: TIME + TOPIC + COMMENT
-- Time markers usually appear first
-- Verbs often appear at the end
-- Glosses are given as Chinese characters
-
-ASL grammar:
+- Time markers (今天/明天/昨天) usually appear at the start
+- Verbs often appear at the end of clauses
+- Glosses are written as Chinese characters/compounds
+- Negation 不 typically precedes the verb""",
+    "ASL": """ASL (American Sign Language) grammar:
 - Topic-comment structure: TIME + TOPIC + COMMENT
 - Time markers first: TOMORROW, YESTERDAY, NOW, LAST-WEEK
-- Proper nouns are fingerspelled, written as "FS:NAME" (e.g., "FS:BEIJING")
+- Proper nouns fingerspelled as "FS:NAME" (e.g., "FS:BEIJING")
 - Pronouns: IX-1 (I/me), IX-2 (you), IX-3 (he/she/it)
-- Negation NOT comes after the verb: "I GO NOT" not "I NOT GO"
-- ASL glosses use ALL CAPS English words, hyphens for compounds (e.g., "WANT-TO", "DON'T-KNOW")
-- Yes/no questions get raised eyebrow marker: append "(Q)" to indicate
-
-Examples:
-
-Example 1:
-Input CSL: ["明天", "北京", "我", "去"]
-Chinese: "我明天去北京。"
-English: "I'm going to Beijing tomorrow."
-ASL gloss: ["TOMORROW", "FS:BEIJING", "IX-1", "GO"]
-
-Example 2:
-Input CSL: ["昨天", "妈妈", "家", "我", "吃饭"]
-Chinese: "昨天我在妈妈家吃饭。"
-English: "Yesterday I ate at my mother's house."
-ASL gloss: ["YESTERDAY", "MOTHER", "POSS-3", "HOUSE", "IX-1", "EAT"]
-
-Example 3:
-Input CSL: ["谢谢", "你", "帮助", "我"]
-Chinese: "谢谢你帮助我。"
-English: "Thank you for helping me."
-ASL gloss: ["THANK-YOU", "IX-2", "HELP", "IX-1"]
-
-Output STRICTLY this JSON schema, no prose, no markdown fences:
-{
-  "chinese": "<natural Chinese sentence>",
-  "english": "<natural English sentence>",
-  "asl_gloss": ["GLOSS1", "GLOSS2", ...],
-  "asl_grammar_notes": "<brief note on grammar transformation>"
-}"""
+- Negation NOT often follows the verb: "I GO NOT"
+- Glosses are ALL-CAPS English words, hyphens for compounds (WANT-TO, DON'T-KNOW)
+- Yes/no questions marked with "(Q)" at end""",
+}
 
 
-def build_user_prompt(csl_gloss: list[str]) -> str:
-    return f"""Translate the following CSL gloss sequence:
+SIGN_TO_NATURAL_PROMPT = """You are an expert {sign_system} interpreter.
+Task: convert a {sign_system} gloss sequence into a natural, fluent {natural_lang} sentence.
 
-Input CSL: {json.dumps(csl_gloss, ensure_ascii=False)}
+{grammar_notes}
 
-Apply the 3-stage pipeline and output JSON."""
+The gloss sequence reflects {sign_system} grammar. Your output must reorder/add
+words/particles as needed so the {natural_lang} sentence sounds natural.
+Preserve meaning exactly; do not invent content not implied by the glosses.
+
+Examples for CSL -> Chinese:
+  Input:  ["明天", "北京", "我", "去"]
+  Output: {{"sentence": "我明天去北京。", "notes": "时间词前置，CSL 动词在末位调整到自然位置"}}
+
+Examples for ASL -> English:
+  Input:  ["TOMORROW", "FS:BEIJING", "IX-1", "GO"]
+  Output: {{"sentence": "I'm going to Beijing tomorrow.", "notes": "ASL topic-comment reordered to SVO"}}
+
+Output STRICT JSON only, no markdown:
+{{
+  "sentence": "<natural {natural_lang} sentence>",
+  "notes": "<one-line note on grammar/word adjustments>"
+}}"""
 
 
-class TextCrossSignTranslator:
+NATURAL_TO_SIGN_PROMPT = """You are an expert {sign_system} interpreter.
+Task: convert a natural {natural_lang} sentence into a {sign_system} gloss sequence.
+
+{grammar_notes}
+
+Reorder/drop function words (articles, copulas, prepositions) as appropriate.
+Use the gloss conventions for {sign_system}.
+
+Examples for Chinese -> CSL:
+  Input:  "我明天去北京。"
+  Output: {{"gloss": ["明天", "北京", "我", "去"], "notes": "时间词前置，topic-comment"}}
+
+Examples for English -> ASL:
+  Input:  "I'm going to Beijing tomorrow."
+  Output: {{"gloss": ["TOMORROW", "FS:BEIJING", "IX-1", "GO"], "notes": "time-first, proper noun fingerspelled"}}
+
+Output STRICT JSON only, no markdown:
+{{
+  "gloss": ["GLOSS1", "GLOSS2", ...],
+  "notes": "<one-line note on grammar/reordering>"
+}}"""
+
+
+class SignNaturalTranslator:
+    """Bidirectional translator between ONE sign system and its paired natural language."""
+
     def __init__(self, model_id: str = MODEL_ID):
         self.model_id = model_id
         self.processor = AutoProcessor.from_pretrained(model_id)
@@ -96,12 +113,41 @@ class TextCrossSignTranslator:
         self.model.eval()
 
     @torch.inference_mode()
-    def translate(self, csl_gloss: list[str]) -> dict[str, Any]:
-        messages = [
-            {"role": "system", "content": [{"type": "text", "text": CROSS_SIGN_SYSTEM_PROMPT}]},
-            {"role": "user", "content": [{"type": "text", "text": build_user_prompt(csl_gloss)}]},
-        ]
+    def sign_to_natural(
+        self, gloss: list[str], sign_system: SignSystem, natural_lang: str
+    ) -> dict[str, Any]:
+        system_prompt = SIGN_TO_NATURAL_PROMPT.format(
+            sign_system=sign_system,
+            natural_lang=natural_lang,
+            grammar_notes=SIGN_GRAMMAR_NOTES[sign_system],
+        )
+        user_prompt = (
+            f"Convert this {sign_system} gloss sequence to natural {natural_lang}:\n"
+            f"{json.dumps(gloss, ensure_ascii=False)}"
+        )
+        return self._generate(system_prompt, user_prompt, input_repr=gloss)
 
+    @torch.inference_mode()
+    def natural_to_sign(
+        self, text: str, sign_system: SignSystem, natural_lang: str
+    ) -> dict[str, Any]:
+        system_prompt = NATURAL_TO_SIGN_PROMPT.format(
+            sign_system=sign_system,
+            natural_lang=natural_lang,
+            grammar_notes=SIGN_GRAMMAR_NOTES[sign_system],
+        )
+        user_prompt = (
+            f"Convert this {natural_lang} sentence to {sign_system} gloss:\n{text}"
+        )
+        return self._generate(system_prompt, user_prompt, input_repr=text)
+
+    def _generate(
+        self, system_prompt: str, user_prompt: str, input_repr: Any
+    ) -> dict[str, Any]:
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+            {"role": "user", "content": [{"type": "text", "text": user_prompt}]},
+        ]
         inputs = self.processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -117,15 +163,9 @@ class TextCrossSignTranslator:
             top_p=0.9,
             do_sample=True,
         )
-
         trimmed = generated[0, inputs["input_ids"].shape[1]:]
         text = self.processor.decode(trimmed, skip_special_tokens=True)
-
-        return {
-            "input_csl": csl_gloss,
-            "raw": text,
-            "parsed": _try_parse_json(text),
-        }
+        return {"input": input_repr, "raw": text, "parsed": _try_parse_json(text)}
 
 
 def _try_parse_json(text: str) -> dict[str, Any] | None:
